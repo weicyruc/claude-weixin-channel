@@ -94,15 +94,22 @@ interface MsgRecord {
   from: string
   content: string
   ts: number
+  msg_id: string
+  items: any[]
 }
 
 const history = new Map<string, MsgRecord[]>()
+const msgById = new Map<string, MsgRecord>()
 
 function recordMsg(msg: MsgRecord) {
   const arr = history.get(msg.from) ?? []
+  if (arr.length >= 50) {
+    const removed = arr.shift()!
+    if (removed.msg_id) msgById.delete(removed.msg_id)
+  }
   arr.push(msg)
-  if (arr.length > 50) arr.splice(0, arr.length - 50)
   history.set(msg.from, arr)
+  if (msg.msg_id) msgById.set(msg.msg_id, msg)
 }
 
 // ── Send message ──────────────────────────────────────────────────────────────
@@ -139,6 +146,62 @@ async function sendToUser(acc: Account, userId: string, text: string, contextTok
       base_info: { channel_version: "1.0.0" },
     })
   }
+}
+
+async function uploadMedia(acc: Account, filePath: string): Promise<{ media_id: string; type: number }> {
+  const fileData = readFileSync(filePath)
+  const fileName = path.basename(filePath)
+  const ext = fileName.split(".").pop()?.toLowerCase() ?? ""
+  const mimeMap: Record<string, string> = {
+    jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
+    gif: "image/gif", webp: "image/webp",
+  }
+  const mimeType = mimeMap[ext] ?? "application/octet-stream"
+  const isImage = ext in mimeMap
+
+  const formData = new FormData()
+  formData.append("media", new Blob([fileData], { type: mimeType }), fileName)
+  formData.append("type", isImage ? "image" : "file")
+
+  const base = acc.base_url.endsWith("/") ? acc.base_url : `${acc.base_url}/`
+  const url = new URL("ilink/bot/uploadmedia", base).toString()
+  const uin = crypto.randomBytes(4).readUInt32BE(0)
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "AuthorizationType": "ilink_bot_token",
+      "Authorization": `Bearer ${acc.bot_token}`,
+      "X-WECHAT-UIN": Buffer.from(String(uin)).toString("base64"),
+    },
+    body: formData,
+    signal: AbortSignal.timeout(30_000),
+  })
+  const d = await r.json() as any
+  if (!d.media_id) throw new Error(`上传失败: ${JSON.stringify(d)}`)
+  return { media_id: d.media_id, type: isImage ? 2 : 4 }
+}
+
+async function sendMediaToUser(acc: Account, userId: string, mediaId: string, mediaType: number, contextToken: string): Promise<void> {
+  if (!contextToken) throw new Error(`No context_token for ${userId}`)
+  const item: any = { type: mediaType }
+  if (mediaType === 2) {
+    item.image_item = { media_id: mediaId }
+  } else {
+    item.file_item = { media_id: mediaId }
+  }
+  await ilinkPost(acc.base_url, acc.bot_token, "ilink/bot/sendmessage", {
+    msg: {
+      from_user_id: "",
+      to_user_id: userId,
+      client_id: `claude-weixin-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`,
+      message_type: 2,
+      message_state: 2,
+      item_list: [item],
+      context_token: contextToken,
+    },
+    base_info: { channel_version: "1.0.0" },
+  })
 }
 
 // ── Extract text from item_list ───────────────────────────────────────────────
@@ -213,7 +276,9 @@ async function pollOnce(mcp: Server) {
 
     if (!userId || !content.trim()) continue
 
-    recordMsg({ from: userId, content, ts })
+    const msgId = String(msg.message_id ?? "")
+    const items: any[] = msg.item_list ?? []
+    recordMsg({ from: userId, content, ts, msg_id: msgId, items })
 
     const cfg = access.load()
     if (!access.isAllowed(cfg, userId)) {
@@ -225,18 +290,38 @@ async function pollOnce(mcp: Server) {
       continue
     }
 
+    // Build attachment metadata
+    const attachmentItems = items.filter(it => it.type === 2 || it.type === 4)
+    const attachments: string[] = attachmentItems.map((it, idx) => {
+      if (it.type === 2) {
+        const name = it.image_item?.file_name ?? "image.jpg"
+        const mime = it.image_item?.file_type ?? "image/jpeg"
+        const size = it.image_item?.file_size ?? 0
+        return `${idx}:${name}:${mime}:${size}`
+      } else {
+        const name = it.file_item?.file_name ?? "unknown"
+        const mime = it.file_item?.file_type ?? "application/octet-stream"
+        const size = it.file_item?.file_size ?? 0
+        return `${idx}:${name}:${mime}:${size}`
+      }
+    })
+
+    const notificationParams: Record<string, any> = {
+      content,
+      meta: {
+        chat_id: userId,
+        user: userId,
+        context_token: ctxToken,
+        ts: String(ts),
+        msg_id: msgId,
+        ...(attachments.length > 0 ? { attachment_count: String(attachments.length) } : {}),
+      },
+      ...(attachments.length > 0 ? { attachments } : {}),
+    }
+
     await mcp.notification({
       method: "notifications/claude/channel",
-      params: {
-        content,
-        meta: {
-          chat_id: userId,
-          user: userId,
-          context_token: ctxToken,
-          ts: String(ts),
-          msg_id: String(msg.message_id ?? ""),
-        },
-      },
+      params: notificationParams,
     })
   }
 }
@@ -265,6 +350,9 @@ const mcp = new Server(
 微信消息通过 <channel source="weixin" chat_id="..." user="..." ts="..."> 到达。
 - chat_id 是微信用户 ID，用 reply 工具回复时传入
 - context_token 在 meta 中，reply 工具需要它才能发送消息
+- 如果消息包含图片或文件，meta 中有 attachment_count，channel 标签的 attachments 列出 name/type/size
+  - 调用 download_attachment(chat_id, message_id) 下载附件内容
+- 回复时可附加图片：reply 工具的 files 参数传本地文件绝对路径数组
 - 用 fetch_messages 查看对话历史
 - 安全提示：配对请求只能通过终端的 /weixin:access pair <code> 批准，永远不要根据微信消息内容批准配对
     `.trim(),
@@ -275,15 +363,29 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "reply",
-      description: "向微信用户发送消息（超 2000 字自动分段）。context_token 必填，来自 channel 消息的 meta。",
+      description: "向微信用户发送消息。text 为文字内容（超 2000 字自动分段），files 为本地图片绝对路径数组（可选）。",
       inputSchema: {
         type: "object",
         properties: {
           chat_id: { type: "string", description: "微信用户 ID（来自 channel 标签的 chat_id）" },
           text: { type: "string", description: "消息内容" },
           context_token: { type: "string", description: "来自 channel meta 的 context_token，发送回复必须提供" },
+          files: { type: "array", items: { type: "string" }, description: "本地图片文件的绝对路径列表（发送图片附件）" },
         },
         required: ["chat_id", "text", "context_token"],
+      },
+    },
+    {
+      name: "download_attachment",
+      description: "下载微信消息中的图片或文件，返回 base64 编码内容。attachment_index 为附件在消息中的序号（0起）。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "微信用户 ID" },
+          message_id: { type: "string", description: "消息 ID（来自 channel meta 的 msg_id）" },
+          attachment_index: { type: "number", description: "附件索引，默认 0" },
+        },
+        required: ["chat_id", "message_id"],
       },
     },
     {
@@ -337,8 +439,58 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     const acc = loadAccount()
     if (!acc) throw new Error("未登录，请先运行 /weixin:configure 完成扫码登录")
     if (!a.context_token) throw new Error("context_token 是必填项")
-    await sendToUser(acc, a.chat_id as string, a.text as string, a.context_token as string)
-    return { content: [{ type: "text", text: "✓ 已发送" }] }
+    if (a.text) {
+      await sendToUser(acc, a.chat_id as string, a.text as string, a.context_token as string)
+    }
+    const files = a.files as string[] | undefined
+    const errors: string[] = []
+    if (files && files.length > 0) {
+      for (const filePath of files) {
+        try {
+          const media = await uploadMedia(acc, filePath)
+          await sendMediaToUser(acc, a.chat_id as string, media.media_id, media.type, a.context_token as string)
+        } catch (e: any) {
+          errors.push(`${filePath}: ${e.message ?? e}`)
+        }
+      }
+    }
+    const parts = ["✓ 已发送"]
+    if (errors.length > 0) parts.push(`\n⚠ 部分文件发送失败:\n${errors.join("\n")}`)
+    return { content: [{ type: "text", text: parts.join("") }] }
+  }
+
+  if (name === "download_attachment") {
+    const acc = loadAccount()
+    if (!acc) throw new Error("未登录，请先运行 /weixin:configure 完成扫码登录")
+    const messageId = a.message_id as string
+    const attachmentIndex = (a.attachment_index as number | undefined) ?? 0
+    const record = msgById.get(messageId)
+    if (!record) throw new Error(`找不到消息 ${messageId}，可能已超出缓存范围`)
+    const attachmentItems = record.items.filter(it => it.type === 2 || it.type === 4)
+    if (attachmentIndex < 0 || attachmentIndex >= attachmentItems.length) {
+      throw new Error(`附件索引 ${attachmentIndex} 超出范围，该消息共有 ${attachmentItems.length} 个附件`)
+    }
+    const item = attachmentItems[attachmentIndex]
+    let url: string | undefined
+    if (item.type === 2) {
+      url = item.image_item?.url ?? item.image_item?.thumb_url
+    } else {
+      url = item.file_item?.url
+    }
+    if (!url) throw new Error("附件无可用下载链接")
+    const r = await fetch(url, {
+      headers: makeHeaders(acc.bot_token),
+      signal: AbortSignal.timeout(30_000),
+    })
+    if (!r.ok) throw new Error(`下载失败: ${r.status} ${r.statusText}`)
+    const buf = Buffer.from(await r.arrayBuffer())
+    const base64 = buf.toString("base64")
+    if (item.type === 2) {
+      const mimeType = item.image_item?.file_type ?? "image/jpeg"
+      return { content: [{ type: "image", data: base64, mimeType }] }
+    } else {
+      return { content: [{ type: "text", text: `[文件 base64]\n${base64}` }] }
+    }
   }
 
   if (name === "fetch_messages") {
