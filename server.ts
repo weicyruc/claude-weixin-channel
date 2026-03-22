@@ -490,56 +490,113 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       throw new Error(`附件索引 ${attachmentIndex} 超出范围，该消息共有 ${attachmentItems.length} 个附件`)
     }
     const item = attachmentItems[attachmentIndex]
-    let url: string | undefined
-    let mediaId: string | undefined
     const itemData = item.type === 2 ? item.image_item : item.file_item
 
-    // Try all known URL field names
-    if (itemData) {
-      url = itemData.url ?? itemData.thumb_url ?? itemData.cdnurl ?? itemData.cdn_url ?? 
-            itemData.download_url ?? itemData.fileUrl ?? itemData.file_url
-      mediaId = itemData.media_id ?? itemData.mediaId
-    }
+    // iLink stores images as ASN.1 token in url field (not a real URL).
+    // Download via ilink/bot/downloadmedia or ilink/bot/getmedia.
+    const token: string | undefined = itemData?.url
+    const mediaObj: any = itemData?.media
+    const encryptQueryParam: string | undefined = mediaObj?.encrypt_query_param
+    const aesKeyB64: string | undefined = mediaObj?.aes_key
+      ?? (itemData?.aeskey ? Buffer.from(itemData.aeskey).toString("base64") : undefined)
 
-    // If no direct URL, try iLink getmedia API using media_id
-    if (!url && mediaId) {
-      try {
-        const base = acc.base_url.endsWith("/") ? acc.base_url : `${acc.base_url}/`
-        const apiUrl = new URL("ilink/bot/getmedia", base).toString()
-        const r2 = await fetch(apiUrl, {
-          method: "POST",
-          headers: makeHeaders(acc.bot_token),
-          body: JSON.stringify({ media_id: mediaId }),
-          signal: AbortSignal.timeout(10_000),
-        })
-        if (r2.ok) {
-          const d2 = await r2.json() as any
-          url = d2.url ?? d2.download_url ?? d2.cdn_url ?? d2.cdnurl
-        }
-      } catch (e) {
-        process.stderr.write(`[weixin] getmedia failed for ${mediaId}: ${e}\n`)
+    const apiBase = acc.base_url.endsWith("/") ? acc.base_url : `${acc.base_url}/`
+
+    function makeAuthHeaders(): Record<string, string> {
+      const uin = crypto.randomBytes(4).readUInt32BE(0)
+      return {
+        "Content-Type": "application/json",
+        "AuthorizationType": "ilink_bot_token",
+        "Authorization": `Bearer ${acc.bot_token}`,
+        "X-WECHAT-UIN": Buffer.from(String(uin)).toString("base64"),
       }
     }
 
-    // Validate URL is absolute http/https
-    const isValidUrl = (s: string | undefined): s is string =>
-      typeof s === "string" && (s.startsWith("http://") || s.startsWith("https://"))
+    let imgBuf: Buffer | undefined
+    const dlErrors: string[] = []
 
-    // Fix protocol-relative URLs (//cdn.xxx.com/...)
-    if (typeof url === "string" && url.startsWith("//")) url = "https:" + url
-
-    if (!isValidUrl(url)) {
-      throw new Error(`附件无可用下载链接，url 原始值: ${JSON.stringify(url)}，item 完整数据: ${JSON.stringify(item)}`)
+    // Strategy 1: POST ilink/bot/downloadmedia
+    if (!imgBuf && token && encryptQueryParam) {
+      try {
+        const endpoint = new URL("ilink/bot/downloadmedia", apiBase).toString()
+        const bodyStr = JSON.stringify({ token, encrypt_query_param: encryptQueryParam, aes_key: aesKeyB64 })
+        const hdrs = { ...makeAuthHeaders(), "Content-Length": String(Buffer.byteLength(bodyStr)) }
+        const r1 = await fetch(endpoint, { method: "POST", headers: hdrs, body: bodyStr, signal: AbortSignal.timeout(30_000) })
+        process.stderr.write(`[weixin] downloadmedia status=${r1.status} ct=${r1.headers.get("content-type")}\n`)
+        if (r1.ok) {
+          const ct = r1.headers.get("content-type") ?? ""
+          if (ct.includes("image") || ct.includes("octet")) {
+            imgBuf = Buffer.from(await r1.arrayBuffer())
+          } else {
+            const txt = await r1.text()
+            process.stderr.write(`[weixin] downloadmedia body: ${txt.slice(0, 400)}\n`)
+            // Maybe it returned a JSON with a CDN url
+            try {
+              const j = JSON.parse(txt)
+              const cdnUrl = j.url ?? j.cdn_url ?? j.download_url ?? j.cdnurl
+              if (typeof cdnUrl === "string" && cdnUrl.startsWith("http")) {
+                const r1b = await fetch(cdnUrl, { signal: AbortSignal.timeout(30_000) })
+                if (r1b.ok) imgBuf = Buffer.from(await r1b.arrayBuffer())
+              }
+            } catch {}
+            if (!imgBuf) dlErrors.push(`downloadmedia: ${txt.slice(0, 150)}`)
+          }
+        } else {
+          const txt = await r1.text()
+          dlErrors.push(`downloadmedia ${r1.status}: ${txt.slice(0, 150)}`)
+          process.stderr.write(`[weixin] downloadmedia error: ${txt.slice(0, 300)}\n`)
+        }
+      } catch (e: any) {
+        const msg = `downloadmedia exception: ${e.message ?? e}`
+        dlErrors.push(msg)
+        process.stderr.write(`[weixin] ${msg}\n`)
+      }
     }
-    const r = await fetch(url, {
-      headers: makeHeaders(acc.bot_token),
-      signal: AbortSignal.timeout(30_000),
-    })
-    if (!r.ok) throw new Error(`下载失败: ${r.status} ${r.statusText}`)
-    const buf = Buffer.from(await r.arrayBuffer())
-    const base64 = buf.toString("base64")
+
+    // Strategy 2: POST ilink/bot/getmedia with full media object
+    if (!imgBuf && (token || encryptQueryParam)) {
+      try {
+        const endpoint2 = new URL("ilink/bot/getmedia", apiBase).toString()
+        const bodyStr2 = JSON.stringify({ token, media: mediaObj, aes_key: aesKeyB64, base_info: { channel_version: "1.0.0" } })
+        const hdrs2 = { ...makeAuthHeaders(), "Content-Length": String(Buffer.byteLength(bodyStr2)) }
+        const r2 = await fetch(endpoint2, { method: "POST", headers: hdrs2, body: bodyStr2, signal: AbortSignal.timeout(30_000) })
+        process.stderr.write(`[weixin] getmedia status=${r2.status} ct=${r2.headers.get("content-type")}\n`)
+        if (r2.ok) {
+          const ct2 = r2.headers.get("content-type") ?? ""
+          if (ct2.includes("image") || ct2.includes("octet")) {
+            imgBuf = Buffer.from(await r2.arrayBuffer())
+          } else {
+            const txt2 = await r2.text()
+            process.stderr.write(`[weixin] getmedia body: ${txt2.slice(0, 400)}\n`)
+            try {
+              const j2 = JSON.parse(txt2)
+              const cdnUrl2 = j2.url ?? j2.cdn_url ?? j2.download_url ?? j2.cdnurl
+              if (typeof cdnUrl2 === "string" && cdnUrl2.startsWith("http")) {
+                const r2b = await fetch(cdnUrl2, { signal: AbortSignal.timeout(30_000) })
+                if (r2b.ok) imgBuf = Buffer.from(await r2b.arrayBuffer())
+              }
+            } catch {}
+            if (!imgBuf) dlErrors.push(`getmedia: ${txt2.slice(0, 150)}`)
+          }
+        } else {
+          const txt2 = await r2.text()
+          dlErrors.push(`getmedia ${r2.status}: ${txt2.slice(0, 150)}`)
+          process.stderr.write(`[weixin] getmedia error: ${txt2.slice(0, 300)}\n`)
+        }
+      } catch (e: any) {
+        const msg2 = `getmedia exception: ${e.message ?? e}`
+        dlErrors.push(msg2)
+        process.stderr.write(`[weixin] ${msg2}\n`)
+      }
+    }
+
+    if (!imgBuf) {
+      throw new Error(`无法下载图片，尝试了以下策略均失败:\n${dlErrors.join("\n")}`)
+    }
+
+    const mimeType = item.type === 2 ? (itemData?.file_type ?? "image/jpeg") : "application/octet-stream"
+    const base64 = imgBuf.toString("base64")
     if (item.type === 2) {
-      const mimeType = item.image_item?.file_type ?? "image/jpeg"
       return { content: [{ type: "image", data: base64, mimeType }] }
     } else {
       return { content: [{ type: "text", text: `[文件 base64]\n${base64}` }] }
