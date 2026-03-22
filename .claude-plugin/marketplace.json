@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "weicyruc-plugins",
+  "description": "Claude Code plugins by weicyruc",
+  "owner": {
+    "name": "weicyruc"
+  },
+  "plugins": [
+    {
+      "name": "weixin",
+      "description": "WeChat channel for Claude Code — connect WeChat direct messages to Claude with built-in access control.",
+      "category": "productivity",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/weicyruc/claude-weixin-channel.git"
+      },
+      "homepage": "https://github.com/weicyruc/claude-weixin-channel"
+    }
+  ]
+}
