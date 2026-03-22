@@ -77,15 +77,24 @@
 - [Claude Code](https://claude.ai/code) 已安装
 - 一个微信账号（用于扫码授权）
 
-### 1. 克隆并安装依赖
+### 1. 克隆并运行安装脚本
 
 ```bash
 git clone https://github.com/weicyruc/claude-weixin-channel.git
 cd claude-weixin-channel
-bun install
+./install.sh
 ```
 
-### 2. 扫码登录微信
+安装脚本会自动完成：
+- 安装 npm 依赖（`bun install`）
+- 在 `~/.claude.json` 中注册 MCP 服务器
+- 在 Claude Code 插件列表中注册，使 `/weixin:configure` 等技能生效
+
+### 2. 重启 Claude Code
+
+**必须重启**才能加载新的 MCP 服务器和技能。
+
+### 3. 扫码登录微信
 
 启动 Claude Code，运行登录技能：
 
