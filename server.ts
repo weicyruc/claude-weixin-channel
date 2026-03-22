@@ -169,22 +169,21 @@ async function pollOnce(mcp: Server) {
 
     recordMsg({ from: userId, content, ts: u.create_time ?? Math.floor(Date.now() / 1000), context_token: ctxToken })
 
-    // Pairing request
-    if (content === "!pair") {
-      const code = access.createPairingCode(userId)
-      try {
-        await sendToUser(acc, userId, `🔐 Claude 配对码：${code}
+    const cfg = access.load()
+    if (!access.isAllowed(cfg, userId)) {
+      if (cfg.policy === "pairing") {
+        const code = access.createPairingCode(userId)
+        try {
+          await sendToUser(acc, userId, `🔐 Claude 配对码：${code}
 
 请在终端运行：
 /weixin:access pair ${code}
 
 配对码 1 小时内有效。`, ctxToken)
-      } catch { /* ignore */ }
+        } catch { /* ignore */ }
+      }
       continue
     }
-
-    const cfg = access.load()
-    if (!access.isAllowed(cfg, userId)) continue
 
     await mcp.notification({
       method: "notifications/claude/channel",
