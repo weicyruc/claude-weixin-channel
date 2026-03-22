@@ -286,6 +286,13 @@ async function pollOnce(mcp: Server) {
 
     const msgId = String(msg.message_id ?? "")
     const items: any[] = msg.item_list ?? []
+
+    // Debug: log attachment items to understand iLink API field names
+    const debugItems = (msg.item_list ?? []).filter((it: any) => it.type === 2 || it.type === 4)
+    if (debugItems.length > 0) {
+      process.stderr.write(`[weixin] attachment item structure: ${JSON.stringify(debugItems, null, 2)}\n`)
+    }
+
     recordMsg({ from: userId, content, ts, msg_id: msgId, items })
 
     const cfg = access.load()
@@ -484,12 +491,40 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     }
     const item = attachmentItems[attachmentIndex]
     let url: string | undefined
-    if (item.type === 2) {
-      url = item.image_item?.url ?? item.image_item?.thumb_url
-    } else {
-      url = item.file_item?.url
+    let mediaId: string | undefined
+    const itemData = item.type === 2 ? item.image_item : item.file_item
+
+    // Try all known URL field names
+    if (itemData) {
+      url = itemData.url ?? itemData.thumb_url ?? itemData.cdnurl ?? itemData.cdn_url ?? 
+            itemData.download_url ?? itemData.fileUrl ?? itemData.file_url
+      mediaId = itemData.media_id ?? itemData.mediaId
     }
-    if (!url) throw new Error("附件无可用下载链接")
+
+    // If no direct URL, try iLink getmedia API using media_id
+    if (!url && mediaId) {
+      try {
+        const base = acc.base_url.endsWith("/") ? acc.base_url : `${acc.base_url}/`
+        const apiUrl = new URL("ilink/bot/getmedia", base).toString()
+        const r2 = await fetch(apiUrl, {
+          method: "POST",
+          headers: makeHeaders(acc.bot_token),
+          body: JSON.stringify({ media_id: mediaId }),
+          signal: AbortSignal.timeout(10_000),
+        })
+        if (r2.ok) {
+          const d2 = await r2.json() as any
+          url = d2.url ?? d2.download_url ?? d2.cdn_url ?? d2.cdnurl
+        }
+      } catch (e) {
+        process.stderr.write(`[weixin] getmedia failed for ${mediaId}: ${e}\n`)
+      }
+    }
+
+    if (!url) {
+      // Return raw item data for debugging
+      throw new Error(`附件无可用下载链接，item 原始数据: ${JSON.stringify(itemData)}`)
+    }
     const r = await fetch(url, {
       headers: makeHeaders(acc.bot_token),
       signal: AbortSignal.timeout(30_000),
