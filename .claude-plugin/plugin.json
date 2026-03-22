@@ -1,0 +1,12 @@
+{
+  "name": "weixin",
+  "description": "WeChat channel for Claude Code — connect WeChat direct messages to Claude with built-in access control. Manage pairing and allowlists via /weixin:access.",
+  "version": "1.0.0",
+  "keywords": [
+    "wechat",
+    "weixin",
+    "messaging",
+    "channel",
+    "mcp"
+  ]
+}
