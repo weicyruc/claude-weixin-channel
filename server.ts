@@ -521,9 +521,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
     }
 
-    if (!url) {
-      // Return raw item data for debugging
-      throw new Error(`附件无可用下载链接，item 原始数据: ${JSON.stringify(itemData)}`)
+    // Validate URL is absolute http/https
+    const isValidUrl = (s: string | undefined): s is string =>
+      typeof s === "string" && (s.startsWith("http://") || s.startsWith("https://"))
+
+    // Fix protocol-relative URLs (//cdn.xxx.com/...)
+    if (typeof url === "string" && url.startsWith("//")) url = "https:" + url
+
+    if (!isValidUrl(url)) {
+      throw new Error(`附件无可用下载链接，url 原始值: ${JSON.stringify(url)}，item 完整数据: ${JSON.stringify(item)}`)
     }
     const r = await fetch(url, {
       headers: makeHeaders(acc.bot_token),
