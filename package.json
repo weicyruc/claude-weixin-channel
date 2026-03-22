@@ -1,0 +1,13 @@
+{
+  "name": "weixin",
+  "version": "1.0.0",
+  "description": "WeChat channel plugin for Claude Code",
+  "type": "module",
+  "scripts": {
+    "start": "bun run server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

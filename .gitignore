@@ -1,0 +1,16 @@
+node_modules/
+bun.lockb
+*.lock
+.env
+.env.*
+
+# Build output
+dist/
+out/
+
+# State files (contain credentials)
+account.json
+access.json
+
+# macOS
+.DS_Store
