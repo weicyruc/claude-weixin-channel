@@ -94,4 +94,8 @@ trap restore_marketplace EXIT
 # trap restores marketplace.json to the GitHub-URL version on exit
 
 echo ""
-echo "Done! Restart Claude Code, then run /weixin:configure to log in."
+echo "Done! Next steps:"
+echo "  1. Restart Claude Code"
+echo "  2. Run /weixin:configure to log in with WeChat QR code"
+echo "  3. Start the channel:"
+echo "     claude --dangerously-load-development-channels plugin:weixin@weicyruc-plugins"

@@ -74,10 +74,17 @@
 ### 前提条件
 
 - [Bun](https://bun.sh) ≥ 1.0
-- [Claude Code](https://claude.ai/code) 已安装
+- [Claude Code](https://claude.ai/code) v2.1.80+ 已安装
 - 一个微信账号（用于扫码授权）
 
-### 1. 克隆并运行安装脚本
+### 方式一：从 GitHub 安装（推荐）
+
+```bash
+claude plugin marketplace add weicyruc/claude-weixin-channel
+claude plugin install weixin@weicyruc-plugins
+```
+
+### 方式二：从本地克隆安装
 
 ```bash
 git clone https://github.com/weicyruc/claude-weixin-channel.git
@@ -87,12 +94,11 @@ cd claude-weixin-channel
 
 安装脚本会自动完成：
 - 安装 npm 依赖（`bun install`）
-- 在 `~/.claude.json` 中注册 MCP 服务器
-- 在 Claude Code 插件列表中注册，使 `/weixin:configure` 等技能生效
+- 通过 `claude plugin` CLI 注册插件，使 `/weixin:configure` 等技能生效
 
 ### 2. 重启 Claude Code
 
-**必须重启**才能加载新的 MCP 服务器和技能。
+**必须重启**才能加载插件和技能。
 
 ### 3. 扫码登录微信
 
@@ -104,13 +110,13 @@ cd claude-weixin-channel
 
 终端会出现 ASCII 二维码，用微信扫码并在手机上确认授权。登录凭证自动保存到 `~/.claude/channels/weixin/account.json`。
 
-### 3. 启动频道
+### 4. 启动频道
+
+> **注意**：非官方插件需要加 `--dangerously-load-development-channels` 标志，这是 Claude Code [channels 研究预览期](https://code.claude.com/docs/en/channels-reference#test-during-the-research-preview)的要求。
 
 ```bash
-claude --channels server:weixin
+claude --dangerously-load-development-channels plugin:weixin@weicyruc-plugins
 ```
-
-> 或者在已有会话中通过 MCP 配置加载。
 
 ### 4. 配对第一个用户
 
@@ -285,7 +291,7 @@ bun run server.ts  # 需先完成登录
 
 **How it works:**
 1. Scan a QR code to authorize a WeChat bot account
-2. Start the MCP server: `claude --channels server:weixin`
+2. Start the channel: `claude --dangerously-load-development-channels plugin:weixin@weicyruc-plugins`
 3. WeChat DMs are forwarded to Claude Code via `notifications/claude/channel`
 4. Claude replies using the `reply` MCP tool
 
