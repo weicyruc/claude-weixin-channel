@@ -492,130 +492,54 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     const item = attachmentItems[attachmentIndex]
     const itemData = item.type === 2 ? item.image_item : item.file_item
 
-    // iLink stores images as ASN.1 token in url field (not a real URL).
-    // Download via ilink/bot/downloadmedia or ilink/bot/getmedia.
-    const token: string | undefined = itemData?.url
-    const mediaObj: any = itemData?.media
-    const encryptQueryParam: string | undefined = mediaObj?.encrypt_query_param
-    const aesKeyB64: string | undefined = mediaObj?.aes_key
-      ?? (itemData?.aeskey ? Buffer.from(itemData.aeskey).toString("base64") : undefined)
+    const encryptQueryParam: string | undefined = itemData?.media?.encrypt_query_param
+    if (!encryptQueryParam) {
+      throw new Error("附件缺少 encrypt_query_param，无法下载")
+    }
 
-    const apiBase = acc.base_url.endsWith("/") ? acc.base_url : `${acc.base_url}/`
-
-    function makeAuthHeaders(): Record<string, string> {
-      const uin = crypto.randomBytes(4).readUInt32BE(0)
-      return {
-        "Content-Type": "application/json",
-        "AuthorizationType": "ilink_bot_token",
-        "Authorization": `Bearer ${acc.bot_token}`,
-        "X-WECHAT-UIN": Buffer.from(String(uin)).toString("base64"),
+    // Resolve AES key: prefer hex aeskey, fall back to base64 media.aes_key
+    let aesKey: Buffer | undefined
+    const aesKeyHex: string | undefined = itemData?.aeskey
+    const aesKeyB64: string | undefined = itemData?.media?.aes_key
+    if (aesKeyHex) {
+      aesKey = Buffer.from(aesKeyHex, "hex")
+    } else if (aesKeyB64) {
+      const decoded = Buffer.from(aesKeyB64, "base64")
+      if (decoded.length === 16) {
+        aesKey = decoded
+      } else if (decoded.length === 32) {
+        aesKey = Buffer.from(decoded.toString("ascii"), "hex")
       }
     }
 
-    let imgBuf: Buffer | undefined
-    const dlErrors: string[] = []
+    // Download from WeChat CDN
+    const cdnBaseUrl = "https://novac2c.cdn.weixin.qq.com/c2c"
+    const cdnUrl = `${cdnBaseUrl}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`
+    process.stderr.write(`[weixin] downloading from CDN: ${cdnUrl.slice(0, 150)}\n`)
 
-    // Helper: try fetching a URL and set imgBuf if success
-    async function tryFetch(label: string, url: string, opts: RequestInit = {}): Promise<boolean> {
-      try {
-        process.stderr.write(`[weixin] trying ${label}: ${url.slice(0, 120)}\n`)
-        const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(30_000) })
-        const ct = r.headers.get("content-type") ?? ""
-        const body = await r.arrayBuffer()
-        const txt = Buffer.from(body).toString("utf-8")
-        process.stderr.write(`[weixin] ${label} status=${r.status} ct=${ct} bodyLen=${body.byteLength} body=${txt.slice(0, 500)}\n`)
-        if (r.ok && (ct.includes("image") || ct.includes("octet") || body.byteLength > 1000)) {
-          imgBuf = Buffer.from(body)
-          return true
-        }
-        // Check if response is JSON with a CDN URL inside
-        try {
-          const j = JSON.parse(txt)
-          const cdnUrl = j.url ?? j.cdn_url ?? j.download_url ?? j.cdnurl ?? j.data?.url
-          if (typeof cdnUrl === "string" && cdnUrl.startsWith("http")) {
-            const r2 = await fetch(cdnUrl, { signal: AbortSignal.timeout(30_000) })
-            if (r2.ok) { imgBuf = Buffer.from(await r2.arrayBuffer()); return true }
-          }
-        } catch {}
-        dlErrors.push(`${label} ${r.status}: ${txt.slice(0, 200)}`)
-      } catch (e: any) {
-        dlErrors.push(`${label} exception: ${e.message ?? e}`)
-        process.stderr.write(`[weixin] ${label} exception: ${e.message ?? e}\n`)
-      }
-      return false
+    const resp = await fetch(cdnUrl, { signal: AbortSignal.timeout(30_000) })
+    if (!resp.ok) {
+      throw new Error(`CDN 下载失败: HTTP ${resp.status} ${resp.statusText}`)
+    }
+    const rawBuf = Buffer.from(await resp.arrayBuffer())
+    if (rawBuf.length === 0) {
+      throw new Error("CDN 返回空数据")
     }
 
-    const postHdrs = (body: string) => ({ ...makeAuthHeaders(), "Content-Length": String(Buffer.byteLength(body)) })
-
-    // Strategy 1: decode encrypt_query_param — maybe it IS a URL or query string for CDN
-    if (!imgBuf && encryptQueryParam) {
-      try {
-        const decoded = Buffer.from(encryptQueryParam, "base64").toString("utf-8")
-        process.stderr.write(`[weixin] encrypt_query_param decoded: ${decoded.slice(0, 300)}\n`)
-        if (decoded.startsWith("http")) {
-          await tryFetch("direct-decoded-url", decoded)
-        }
-      } catch {}
-    }
-
-    // Strategy 2: try known iLink API endpoint variants (POST)
-    const endpoints = [
-      "ilink/bot/get_media",
-      "ilink/bot/media/download",
-      "ilink/bot/media/get",
-      "ilink/bot/getimg",
-      "ilink/bot/get_img",
-      "ilink/bot/msgmedia",
-      "ilink/bot/getmsgmedia",
-    ]
-    for (const ep of endpoints) {
-      if (imgBuf) break
-      const body = JSON.stringify({ token, encrypt_query_param: encryptQueryParam, aes_key: aesKeyB64, media: mediaObj, base_info: { channel_version: "1.0.0" } })
-      await tryFetch(ep, new URL(ep, apiBase).toString(), { method: "POST", headers: postHdrs(body), body })
-    }
-
-    // Strategy 3: WeChat CDN with encrypt_query_param as query parameter
-    if (!imgBuf && encryptQueryParam) {
-      const cdnBases = [
-        "https://cdn.weixin.qq.com/cgi-bin/ilink/getmedia",
-        "https://cdn.weixin.qq.com/cgi-bin/ilink/media",
-        "https://ilinkai.weixin.qq.com/ilink/media/download",
-      ]
-      const uin = crypto.randomBytes(4).readUInt32BE(0)
-      const cdnHdrs = {
-        "AuthorizationType": "ilink_bot_token",
-        "Authorization": `Bearer ${acc.bot_token}`,
-        "X-WECHAT-UIN": Buffer.from(String(uin)).toString("base64"),
-      }
-      for (const base of cdnBases) {
-        if (imgBuf) break
-        const u = `${base}?encrypt_query_param=${encodeURIComponent(encryptQueryParam)}`
-        await tryFetch(`cdn:${base.split("/").pop()}`, u, { headers: cdnHdrs })
-      }
-    }
-
-    // Strategy 4: GET request to iLink with token as query param
-    if (!imgBuf && token) {
-      const uin = crypto.randomBytes(4).readUInt32BE(0)
-      const getHdrs = {
-        "AuthorizationType": "ilink_bot_token",
-        "Authorization": `Bearer ${acc.bot_token}`,
-        "X-WECHAT-UIN": Buffer.from(String(uin)).toString("base64"),
-      }
-      const getEps = ["ilink/bot/getmedia", "ilink/bot/downloadmedia", "ilink/bot/get_media"]
-      for (const ep of getEps) {
-        if (imgBuf) break
-        const u = `${apiBase}${ep}?token=${encodeURIComponent(token)}&encrypt_query_param=${encodeURIComponent(encryptQueryParam ?? "")}`
-        await tryFetch(`GET:${ep}`, u, { headers: getHdrs })
-      }
-    }
-
-    if (!imgBuf) {
-      throw new Error(`无法下载图片，尝试了以下策略均失败:\n${dlErrors.join("\n")}`)
+    // Decrypt with AES-128-ECB if key is available
+    let resultBuf: Buffer
+    if (aesKey) {
+      process.stderr.write(`[weixin] decrypting with AES-128-ECB, key length=${aesKey.length}\n`)
+      const decipher = crypto.createDecipheriv("aes-128-ecb", aesKey, null)
+      decipher.setAutoPadding(true)
+      resultBuf = Buffer.concat([decipher.update(rawBuf), decipher.final()])
+    } else {
+      process.stderr.write("[weixin] no AES key found, using raw bytes\n")
+      resultBuf = rawBuf
     }
 
     const mimeType = item.type === 2 ? (itemData?.file_type ?? "image/jpeg") : "application/octet-stream"
-    const base64 = imgBuf.toString("base64")
+    const base64 = resultBuf.toString("base64")
     if (item.type === 2) {
       return { content: [{ type: "image", data: base64, mimeType }] }
     } else {
