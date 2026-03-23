@@ -515,78 +515,98 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     let imgBuf: Buffer | undefined
     const dlErrors: string[] = []
 
-    // Strategy 1: POST ilink/bot/downloadmedia
-    if (!imgBuf && token && encryptQueryParam) {
+    // Helper: try fetching a URL and set imgBuf if success
+    async function tryFetch(label: string, url: string, opts: RequestInit = {}): Promise<boolean> {
       try {
-        const endpoint = new URL("ilink/bot/downloadmedia", apiBase).toString()
-        const bodyStr = JSON.stringify({ token, encrypt_query_param: encryptQueryParam, aes_key: aesKeyB64 })
-        const hdrs = { ...makeAuthHeaders(), "Content-Length": String(Buffer.byteLength(bodyStr)) }
-        const r1 = await fetch(endpoint, { method: "POST", headers: hdrs, body: bodyStr, signal: AbortSignal.timeout(30_000) })
-        process.stderr.write(`[weixin] downloadmedia status=${r1.status} ct=${r1.headers.get("content-type")}\n`)
-        if (r1.ok) {
-          const ct = r1.headers.get("content-type") ?? ""
-          if (ct.includes("image") || ct.includes("octet")) {
-            imgBuf = Buffer.from(await r1.arrayBuffer())
-          } else {
-            const txt = await r1.text()
-            process.stderr.write(`[weixin] downloadmedia body: ${txt.slice(0, 400)}\n`)
-            // Maybe it returned a JSON with a CDN url
-            try {
-              const j = JSON.parse(txt)
-              const cdnUrl = j.url ?? j.cdn_url ?? j.download_url ?? j.cdnurl
-              if (typeof cdnUrl === "string" && cdnUrl.startsWith("http")) {
-                const r1b = await fetch(cdnUrl, { signal: AbortSignal.timeout(30_000) })
-                if (r1b.ok) imgBuf = Buffer.from(await r1b.arrayBuffer())
-              }
-            } catch {}
-            if (!imgBuf) dlErrors.push(`downloadmedia: ${txt.slice(0, 150)}`)
-          }
-        } else {
-          const txt = await r1.text()
-          dlErrors.push(`downloadmedia ${r1.status}: ${txt.slice(0, 150)}`)
-          process.stderr.write(`[weixin] downloadmedia error: ${txt.slice(0, 300)}\n`)
+        process.stderr.write(`[weixin] trying ${label}: ${url.slice(0, 120)}\n`)
+        const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(30_000) })
+        const ct = r.headers.get("content-type") ?? ""
+        const body = await r.arrayBuffer()
+        const txt = Buffer.from(body).toString("utf-8")
+        process.stderr.write(`[weixin] ${label} status=${r.status} ct=${ct} bodyLen=${body.byteLength} body=${txt.slice(0, 500)}\n`)
+        if (r.ok && (ct.includes("image") || ct.includes("octet") || body.byteLength > 1000)) {
+          imgBuf = Buffer.from(body)
+          return true
         }
+        // Check if response is JSON with a CDN URL inside
+        try {
+          const j = JSON.parse(txt)
+          const cdnUrl = j.url ?? j.cdn_url ?? j.download_url ?? j.cdnurl ?? j.data?.url
+          if (typeof cdnUrl === "string" && cdnUrl.startsWith("http")) {
+            const r2 = await fetch(cdnUrl, { signal: AbortSignal.timeout(30_000) })
+            if (r2.ok) { imgBuf = Buffer.from(await r2.arrayBuffer()); return true }
+          }
+        } catch {}
+        dlErrors.push(`${label} ${r.status}: ${txt.slice(0, 200)}`)
       } catch (e: any) {
-        const msg = `downloadmedia exception: ${e.message ?? e}`
-        dlErrors.push(msg)
-        process.stderr.write(`[weixin] ${msg}\n`)
+        dlErrors.push(`${label} exception: ${e.message ?? e}`)
+        process.stderr.write(`[weixin] ${label} exception: ${e.message ?? e}\n`)
+      }
+      return false
+    }
+
+    const postHdrs = (body: string) => ({ ...makeAuthHeaders(), "Content-Length": String(Buffer.byteLength(body)) })
+
+    // Strategy 1: decode encrypt_query_param — maybe it IS a URL or query string for CDN
+    if (!imgBuf && encryptQueryParam) {
+      try {
+        const decoded = Buffer.from(encryptQueryParam, "base64").toString("utf-8")
+        process.stderr.write(`[weixin] encrypt_query_param decoded: ${decoded.slice(0, 300)}\n`)
+        if (decoded.startsWith("http")) {
+          await tryFetch("direct-decoded-url", decoded)
+        }
+      } catch {}
+    }
+
+    // Strategy 2: try known iLink API endpoint variants (POST)
+    const endpoints = [
+      "ilink/bot/get_media",
+      "ilink/bot/media/download",
+      "ilink/bot/media/get",
+      "ilink/bot/getimg",
+      "ilink/bot/get_img",
+      "ilink/bot/msgmedia",
+      "ilink/bot/getmsgmedia",
+    ]
+    for (const ep of endpoints) {
+      if (imgBuf) break
+      const body = JSON.stringify({ token, encrypt_query_param: encryptQueryParam, aes_key: aesKeyB64, media: mediaObj, base_info: { channel_version: "1.0.0" } })
+      await tryFetch(ep, new URL(ep, apiBase).toString(), { method: "POST", headers: postHdrs(body), body })
+    }
+
+    // Strategy 3: WeChat CDN with encrypt_query_param as query parameter
+    if (!imgBuf && encryptQueryParam) {
+      const cdnBases = [
+        "https://cdn.weixin.qq.com/cgi-bin/ilink/getmedia",
+        "https://cdn.weixin.qq.com/cgi-bin/ilink/media",
+        "https://ilinkai.weixin.qq.com/ilink/media/download",
+      ]
+      const uin = crypto.randomBytes(4).readUInt32BE(0)
+      const cdnHdrs = {
+        "AuthorizationType": "ilink_bot_token",
+        "Authorization": `Bearer ${acc.bot_token}`,
+        "X-WECHAT-UIN": Buffer.from(String(uin)).toString("base64"),
+      }
+      for (const base of cdnBases) {
+        if (imgBuf) break
+        const u = `${base}?encrypt_query_param=${encodeURIComponent(encryptQueryParam)}`
+        await tryFetch(`cdn:${base.split("/").pop()}`, u, { headers: cdnHdrs })
       }
     }
 
-    // Strategy 2: POST ilink/bot/getmedia with full media object
-    if (!imgBuf && (token || encryptQueryParam)) {
-      try {
-        const endpoint2 = new URL("ilink/bot/getmedia", apiBase).toString()
-        const bodyStr2 = JSON.stringify({ token, media: mediaObj, aes_key: aesKeyB64, base_info: { channel_version: "1.0.0" } })
-        const hdrs2 = { ...makeAuthHeaders(), "Content-Length": String(Buffer.byteLength(bodyStr2)) }
-        const r2 = await fetch(endpoint2, { method: "POST", headers: hdrs2, body: bodyStr2, signal: AbortSignal.timeout(30_000) })
-        process.stderr.write(`[weixin] getmedia status=${r2.status} ct=${r2.headers.get("content-type")}\n`)
-        if (r2.ok) {
-          const ct2 = r2.headers.get("content-type") ?? ""
-          if (ct2.includes("image") || ct2.includes("octet")) {
-            imgBuf = Buffer.from(await r2.arrayBuffer())
-          } else {
-            const txt2 = await r2.text()
-            process.stderr.write(`[weixin] getmedia body: ${txt2.slice(0, 400)}\n`)
-            try {
-              const j2 = JSON.parse(txt2)
-              const cdnUrl2 = j2.url ?? j2.cdn_url ?? j2.download_url ?? j2.cdnurl
-              if (typeof cdnUrl2 === "string" && cdnUrl2.startsWith("http")) {
-                const r2b = await fetch(cdnUrl2, { signal: AbortSignal.timeout(30_000) })
-                if (r2b.ok) imgBuf = Buffer.from(await r2b.arrayBuffer())
-              }
-            } catch {}
-            if (!imgBuf) dlErrors.push(`getmedia: ${txt2.slice(0, 150)}`)
-          }
-        } else {
-          const txt2 = await r2.text()
-          dlErrors.push(`getmedia ${r2.status}: ${txt2.slice(0, 150)}`)
-          process.stderr.write(`[weixin] getmedia error: ${txt2.slice(0, 300)}\n`)
-        }
-      } catch (e: any) {
-        const msg2 = `getmedia exception: ${e.message ?? e}`
-        dlErrors.push(msg2)
-        process.stderr.write(`[weixin] ${msg2}\n`)
+    // Strategy 4: GET request to iLink with token as query param
+    if (!imgBuf && token) {
+      const uin = crypto.randomBytes(4).readUInt32BE(0)
+      const getHdrs = {
+        "AuthorizationType": "ilink_bot_token",
+        "Authorization": `Bearer ${acc.bot_token}`,
+        "X-WECHAT-UIN": Buffer.from(String(uin)).toString("base64"),
+      }
+      const getEps = ["ilink/bot/getmedia", "ilink/bot/downloadmedia", "ilink/bot/get_media"]
+      for (const ep of getEps) {
+        if (imgBuf) break
+        const u = `${apiBase}${ep}?token=${encodeURIComponent(token)}&encrypt_query_param=${encodeURIComponent(encryptQueryParam ?? "")}`
+        await tryFetch(`GET:${ep}`, u, { headers: getHdrs })
       }
     }
 
